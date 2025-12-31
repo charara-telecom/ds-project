@@ -10,6 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.language_models.llms import LLM
+from langchain_core.documents import Document
 
 from gemini_helper import GeminiHelper
 import logging
@@ -93,6 +94,21 @@ class GeminiLLM(LLM):
 # ==========================
 # Utilities
 # ==========================
+def _metadata_only_get(store: Chroma, where: Dict[str, Any], limit: int) -> List[Tuple[Any, float]]:
+    if not where:
+        return []
+
+    # Underlying chromadb collection.get(where=..., include=..., limit=...) does NOT do embeddings
+    res = store._collection.get(where=where, include=["documents", "metadatas"], limit=limit)
+
+    docs = []
+    for text, meta in zip(res.get("documents", []) or [], res.get("metadatas", []) or []):
+        docs.append((Document(page_content=text or "", metadata=meta or {}), 1.0))
+
+    # Optional: deterministic ordering (since get() is not "similarity ranked")
+    docs.sort(key=lambda x: (x[0].metadata.get("date_ts") or 0), reverse=True)
+    return docs[:limit]
+
 def _extract_json(raw: str) -> Optional[dict]:
     if not raw:
         return None
@@ -180,9 +196,13 @@ class RAGOut(BaseModel):
 # ==========================
 # Prompts
 # ==========================
-FILTER_PROMPT = """You extract structured filters from movie questions.
+FILTER_PROMPT = """You extract:
+1) structured filters from movie questions
+2) an OPTIONAL semantic retrieval query to search text chunks (NOT metadata)
+
 Return ONLY JSON (no markdown) with exactly:
 {{
+  "semantic_query": null or string,
   "movie_title": null or string,
   "min_rating": null or number,
   "max_rating": null or number,
@@ -190,6 +210,12 @@ Return ONLY JSON (no markdown) with exactly:
 }}
 
 Rules:
+- semantic_query:
+  - If the user asks about a TOPIC/aspect (e.g. visuals, acting, ending, plot, themes, "what do people say about X"),
+    set semantic_query to a short search-friendly rewrite.
+  - If the user is ONLY filtering (rating/date/movie title) and NOT asking about any aspect/topic,
+    set semantic_query=null.
+  - MUST NOT include metadata constraints (ratings, time ranges, "last year", etc.)
 - "last year" => days_back=365
 - "last 10 years" => days_back=3650
 - If no time constraint => days_back=null
@@ -199,6 +225,9 @@ Rules:
 User question:
 {question}
 """
+
+
+
 
 RAG_PROMPT = ChatPromptTemplate.from_template(
     """Answer using ONLY the information below. don't look for answers outside the provided contexts. and always answer in a way that doesnt look like you have such context, just a normal answer.
@@ -264,68 +293,70 @@ def build_chain(gemini: GeminiHelper, k_reviews: int = 5, k_desc: int = 5):
         q = inp["question"]
         raw = gemini.answer_and_rotate(FILTER_PROMPT.format(question=q))
         data = _extract_json(raw) or {}
+
         filters = {
             "movie_title": data.get("movie_title"),
             "min_rating": data.get("min_rating"),
             "max_rating": data.get("max_rating"),
             "days_back": data.get("days_back"),
         }
-        return {"question": q, "filters": filters}
+
+        semantic_query = data.get("semantic_query")
+        if not isinstance(semantic_query, str) or not semantic_query.strip():
+            semantic_query = None  # <- IMPORTANT (no embedding query)
+
+        return {"question": q, "semantic_query": semantic_query, "filters": filters}
+
+
 
     def retrieve_step(inp: Dict[str, Any]) -> Dict[str, Any]:
-        q = inp["question"]
+        user_q = inp["question"]
+        semantic_query = inp.get("semantic_query")  # can be None
         filters = inp["filters"]
 
-        # ---- Reviews retrieval (filtered; NO fallback) ----
         chroma_filter = _build_chroma_filter(filters)
 
-        reviews_docs_and_scores = reviews_store.similarity_search_with_relevance_scores(
-            q, k=k_reviews, filter=chroma_filter or None
-        )
+        # ---- Reviews retrieval ----
+        if semantic_query:
+            reviews_docs_and_scores = reviews_store.similarity_search_with_relevance_scores(
+                semantic_query, k=k_reviews, filter=chroma_filter or None
+            )
+            logger.info("MODE=semantic+filters")
+            logger.info("RETRIEVAL_QUERY=%r", semantic_query)
+        else:
+            # metadata-only path: NO embedding search
+            # pull a bit more than k then sort by date_ts (optional)
+            meta_limit = max(k_reviews * 5, 50)
+            reviews_docs_and_scores = _metadata_only_get(reviews_store, chroma_filter or {}, meta_limit)[:k_reviews]
+            logger.info("MODE=filters-only (no embeddings)")
 
-        logger.info("QUERY=%r", q)
+        logger.info("USER_QUERY=%r", user_q)
         logger.info("FILTERS=%s", filters)
         logger.info("USED_REVIEWS_FILTER=%s", chroma_filter)
         logger.info("REVIEWS_RETRIEVED=%d", len(reviews_docs_and_scores))
 
-        for i, (doc, score) in enumerate(reviews_docs_and_scores, 1):
-            meta = doc.metadata or {}
-            snippet = (doc.page_content or "").replace("\n", " ")[:160]
-            logger.info(
-                "  [reviews] #%d score=%.4f title=%r rating=%s date_ts=%s date_iso=%s snippet=%r",
-                i,
-                float(score),
-                meta.get("movie_title"),
-                meta.get("rating"),
-                meta.get("date_ts"),
-                meta.get("date_iso"),
-                snippet,
+        # ---- Descriptions retrieval ----
+        # If semantic_query is None, you said you want "just filters".
+        # We can still fetch description by movie_title only (metadata-only), otherwise skip.
+        if semantic_query:
+            desc_docs_and_scores = desc_store.similarity_search_with_relevance_scores(
+                semantic_query, k=k_desc, filter=None
             )
-
-        # ---- Descriptions retrieval (NO filters) ----
-        desc_docs_and_scores = desc_store.similarity_search_with_relevance_scores(
-            q, k=k_desc, filter=None
-        )
-
-        logger.info("DESCRIPTIONS_RETRIEVED=%d", len(desc_docs_and_scores))
-        for i, (doc, score) in enumerate(desc_docs_and_scores, 1):
-            meta = doc.metadata or {}
-            snippet = (doc.page_content or "").replace("\n", " ")[:160]
-            logger.info(
-                "  [descriptions] #%d score=%.4f title=%r snippet=%r",
-                i,
-                float(score),
-                meta.get("movie_title"),
-                snippet,
-            )
+        else:
+            mt = filters.get("movie_title")
+            if isinstance(mt, str) and mt.strip():
+                desc_docs_and_scores = _metadata_only_get(desc_store, {"movie_title": mt}, limit=k_desc)
+            else:
+                desc_docs_and_scores = []
 
         return {
-            "question": q,
+            "question": user_q,
             "filters": filters,
             "used_filter": chroma_filter,
             "reviews_docs_and_scores": reviews_docs_and_scores,
             "desc_docs_and_scores": desc_docs_and_scores,
         }
+
 
     def prepare_prompt_vars(inp: Dict[str, Any]) -> Dict[str, Any]:
         reviews_ds = inp["reviews_docs_and_scores"]
