@@ -1,0 +1,59 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+wheelhouse/
+
+# Virtualenv / environment
+venv/
+env/
+.venv/
+.env
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Python environment & tooling
+.python-version
+.mypy_cache/
+.pytest_cache/
+pip-log.txt
+pip-delete-this-directory.txt
+Pipfile.lock
+poetry.lock
+
+# Jupyter
+.ipynb_checkpoints
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets / keys
+*.pem
+*.key
+secrets.json
+
+# Database / local storage
+chroma_db/
+chroma_db_v2/
+chroma.sqlite3
+*.sqlite3
+
+# Streamlit / local runtime
+.streamlit/
