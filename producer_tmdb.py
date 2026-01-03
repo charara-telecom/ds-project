@@ -85,6 +85,11 @@ while True:
 
                         producer.send(topic_movie_reviews, review)
                         print(f"Sent review by {review['author']} for movie '{movie_title}'")
+                        print("###############################")
+                        print("review: ", review)
+                        print("###############################")
+                        print("###############################")
+                        print("###############################")
                 else:
                     print(f"Error TMDB reviews: {review_response.status_code} for {movie_title}")
         else:

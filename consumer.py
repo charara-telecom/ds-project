@@ -23,10 +23,12 @@ if not GEMINI_API_KEYS or GEMINI_API_KEYS == [""]:
 KAFKA_TOPIC = "movie-reviews"
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_GROUP_ID = "tmdb-review-consumer"
+KAFKA_TOPIC_DETAILS = "movie-details" # for descriptions
 
 # Create a NEW DB if you want (recommended)
 CHROMA_PATH = "chroma_db_v2"   # <-- change back to "chroma_db" if you want
 COLLECTION_NAME = "tmdb_movie_reviews"
+COLLECTION_DETAILS = "movie_descriptions"
 
 EMBED_MODEL = "text-embedding-004"
 EMBED_DIM = 768
@@ -107,6 +109,30 @@ def build_chroma_record(review: dict) -> Optional[Tuple[str, str, Dict[str, Any]
     return doc_id, content, metadata
 
 
+def build_movie_details_record(movie: dict) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    content = movie.get("overview")
+    if not content:
+        return None
+
+    movie_id = movie.get("movie_id") or movie.get("id")
+    if movie_id is None:
+        return None
+
+    doc_id = f"movie_{movie_id}"
+
+    metadata = {
+        "movie_title": movie.get("title", "Unknown"),
+        "release_date": movie.get("release_date"),
+        "runtime": movie.get("runtime"),
+        "vote_average": movie.get("vote_average"),
+        "popularity": movie.get("popularity"),
+        "source": "tmdb",
+        "movie_id": int(movie_id) if str(movie_id).isdigit() else str(movie_id),
+    }
+
+    return doc_id, content, metadata
+
+
 # ==========================
 # INIT CLIENTS
 # ==========================
@@ -114,9 +140,11 @@ gemini = GeminiHelper(api_keys=GEMINI_API_KEYS)
 
 client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = client.get_or_create_collection(name=COLLECTION_NAME)
+details_collection = client.get_or_create_collection(name=COLLECTION_DETAILS)
 
 consumer = KafkaConsumer(
     KAFKA_TOPIC,
+    KAFKA_TOPIC_DETAILS,
     bootstrap_servers=KAFKA_BOOTSTRAP,
     auto_offset_reset="earliest",
     enable_auto_commit=True,
@@ -133,44 +161,75 @@ print("Waiting for messages...")
 # ==========================
 try:
     for msg in consumer:
-        review = msg.value
+        if msg.topic == KAFKA_TOPIC:
+            review = msg.value
 
-        rec = build_chroma_record(review)
-        if rec is None:
-            continue
+            rec = build_chroma_record(review)
+            if rec is None:
+                continue
 
-        doc_id, content, metadata = rec
+            doc_id, content, metadata = rec
 
-        # Debug metadata (you asked for this)
-        print("\n------------------------------")
-        print("Incoming review -> metadata:")
-        print(json.dumps(metadata, indent=2, ensure_ascii=False))
+            # Debug metadata (you asked for this)
+            print("\n------------------------------")
+            print("Incoming review -> metadata:")
+            print(json.dumps(metadata, indent=2, ensure_ascii=False))
 
-        # 1) Embed
-        try:
-            embedding = gemini.get_embeddings(
-                texts=content,
-                model=EMBED_MODEL,
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=EMBED_DIM,
-            )
-        except Exception as e:
-            print("❌ Embedding error:", e)
-            continue
+            # 1) Embed
+            try:
+                embedding = gemini.get_embeddings(
+                    texts=content,
+                    model=EMBED_MODEL,
+                    task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=EMBED_DIM,
+                )
+            except Exception as e:
+                print("❌ Embedding error:", e)
+                continue
 
-        # 2) Store
-        try:
-            collection.add(
-                ids=[doc_id],
-                documents=[content],
-                metadatas=[metadata],
-                embeddings=[embedding],
-            )
-            print(f"✅ Stored doc_id={doc_id} | movie='{metadata.get('movie_title')}' | rating={metadata.get('rating')} | date_ts={metadata.get('date_ts')}")
-        except Exception as e:
-            # Most common error here is "ID already exists"
-            print("❌ Error adding to Chroma:", e)
-            print("doc_id:", doc_id)
+            # 2) Store
+            try:
+                collection.add(
+                    ids=[doc_id],
+                    documents=[content],
+                    metadatas=[metadata],
+                    embeddings=[embedding],
+                )
+                print(f"✅ Stored doc_id={doc_id} | movie='{metadata.get('movie_title')}' | rating={metadata.get('rating')} | date_ts={metadata.get('date_ts')}")
+            except Exception as e:
+                # Most common error here is "ID already exists"
+                print("❌ Error adding to Chroma:", e)
+                print("doc_id:", doc_id)
+        elif msg.topic == KAFKA_TOPIC_DETAILS:
+            movie = msg.value
+
+            rec = build_movie_details_record(movie)
+            if rec is None:
+                continue
+
+            doc_id, content, metadata = rec
+
+            try:
+                embedding = gemini.get_embeddings(
+                    texts=content,
+                    model=EMBED_MODEL,
+                    task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=EMBED_DIM,
+                )
+            except Exception as e:
+                print("❌ Embedding error (details):", e)
+                continue
+
+            try:
+                details_collection.add(
+                    ids=[doc_id],
+                    documents=[content],
+                    metadatas=[metadata],
+                    embeddings=[embedding],
+                )
+                print(f"✅ Stored MOVIE DETAILS doc_id={doc_id} | title='{metadata.get('movie_title')}'")
+            except Exception as e:
+                print("❌ Error adding movie details:", e)
 
 except KeyboardInterrupt:
     print("\n🛑 Stopping consumer...")
