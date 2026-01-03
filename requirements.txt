@@ -1,0 +1,10 @@
+kafka-python
+chromadb
+google-genai
+python-dotenv
+streamlit
+langchain
+langchain-community
+langchain-core
+pydantic
+requests
