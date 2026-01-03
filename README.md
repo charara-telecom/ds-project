@@ -30,7 +30,6 @@ A real-time data pipeline and RAG (Retrieval-Augmented Generation) application t
 ├── ui.py                # Streamlit application entry point
 ├── gemini_helper.py     # Helper class for Google GenAI SDK interactions
 ├── chroma_inspect.py    # Utility to inspect/debug ChromaDB contents
-├── debug.py             # Simple script to check collection counts
 ├── requirements.txt     # Python dependencies
 └── .env                 # Environment variables (API keys)
 ```
